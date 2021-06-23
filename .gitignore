@@ -1,0 +1,6 @@
+# executable
+nand2tetris-hack-assembler
+
+# IDE config
+.idea
+.vscode

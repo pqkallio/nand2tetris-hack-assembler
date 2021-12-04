@@ -1,4 +1,4 @@
-package main
+package assembler
 
 import (
 	"bufio"
@@ -7,11 +7,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/pqkallio/nand2tetris-hack-assembler/util"
 )
 
 var (
 	nextRamAddress uint16 = 15
-	lineNumber uint16 = 0
+	lineNumber     uint16 = 0
 )
 
 func getNextRAMAddress() uint16 {
@@ -20,7 +22,53 @@ func getNextRAMAddress() uint16 {
 	return nextRamAddress
 }
 
-func assemble(in *os.File, out *os.File) {
+type Writer interface {
+	Write(w *bufio.Writer, i uint16) error
+}
+
+type StringWriter struct{}
+
+func (sw *StringWriter) Write(w *bufio.Writer, i uint16) error {
+	_, err := w.WriteString(sw.stringifyInstruction(i) + "\n")
+	return err
+}
+
+func (sw *StringWriter) stringifyInstruction(instr uint16) string {
+	strInstr := make([]byte, 16)
+
+	for i := 15; i > -1; i-- {
+		switch instr >> i & 1 {
+		case 0:
+			strInstr[i] = '0'
+		case 1:
+			strInstr[i] = '1'
+		}
+	}
+
+	return util.Reverse(string(strInstr))
+}
+
+type BinaryWriter struct{}
+
+func (bw *BinaryWriter) Write(w *bufio.Writer, i uint16) error {
+	_, err := w.Write([]byte{byte(i >> 8), byte(i)})
+	return err
+}
+
+type Server struct {
+	writer Writer
+}
+
+func NewServer(format Format) *Server {
+	switch format {
+	case Binary:
+		return &Server{&BinaryWriter{}}
+	default:
+		return &Server{&StringWriter{}}
+	}
+}
+
+func (s *Server) Assemble(in *os.File, out *os.File) {
 	scanner := bufio.NewScanner(in)
 	writer := bufio.NewWriter(out)
 
@@ -45,7 +93,7 @@ func assemble(in *os.File, out *os.File) {
 
 	_, err := in.Seek(0, io.SeekStart)
 	if err != nil {
-		log.Fatalf("unable to rewind the input file %s: %w", in.Name(), err)
+		log.Fatalf("unable to rewind the input file %s: %s", in.Name(), err)
 	}
 
 	lineNumber = 0
@@ -57,6 +105,7 @@ func assemble(in *os.File, out *os.File) {
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
 
+		// empty line, comment line or label
 		if len(line) == 0 || strings.HasPrefix(line, "/") || strings.HasPrefix(line, "(") {
 			continue
 		}
@@ -77,19 +126,19 @@ func assemble(in *os.File, out *os.File) {
 				address = symbolTable[symbol]
 			}
 
-			_, err := writer.WriteString(Reverse(aInstruction(address)) + "\n")
+			s.writer.Write(writer, address)
 			if err != nil {
-				log.Fatalf("error writing instruction to file %s: %w", out.Name(), err)
+				log.Fatalf("error writing instruction to file %s: %s", out.Name(), err)
 			}
 		} else {
 			// handle C-instructions
 			var (
-				dest, jump, comp uint8
-				exists bool
+				dest, jump, comp uint16
+				exists           bool
 			)
 
-			destStr := "null"
-			jumpStr := "null"
+			destStr := ""
+			jumpStr := ""
 
 			line = strings.SplitN(line, " ", 2)[0]
 			destSplit := strings.SplitN(line, "=", 2)
@@ -119,9 +168,11 @@ func assemble(in *os.File, out *os.File) {
 				log.Fatalf("illegal computation in instruction '%s'", line)
 			}
 
-			_, err := writer.WriteString(Reverse(cInstruction(dest, comp, jump)) + "\n")
+			instr := dest | comp | jump
+
+			err := s.writer.Write(writer, instr)
 			if err != nil {
-				log.Fatalf("error writing instruction to file %s: %w", out.Name(), err)
+				log.Fatalf("error writing instruction to file %s: %s", out.Name(), err)
 			}
 		}
 
@@ -130,61 +181,22 @@ func assemble(in *os.File, out *os.File) {
 
 	err = writer.Flush()
 	if err != nil {
-		log.Fatalf("unable to write buffered data to file %s: %w", out.Name(), err)
+		log.Fatalf("unable to write buffered data to file %s: %s", out.Name(), err)
 	}
 }
 
-func aInstruction(address uint16) string {
-	aInstr := make([]byte, 16, 16)
-	aInstr[15] = '0'
+type Format string
 
-	for i := 14; i > -1; i-- {
-		switch address >> i & 1 {
-		case 0:
-			aInstr[i] = '0'
-		case 1:
-			aInstr[i] = '1'
-		}
-	}
+const (
+	Binary      Format = "binary"
+	Text        Format = "text"
+	NotSelected Format = ""
+)
 
-	return string(aInstr)
+func (f Format) String() string {
+	return string(f)
 }
 
-func cInstruction(dest, comp, jump uint8) string {
-	cInstr := make([]byte, 16, 16)
-
-	i := 15
-
-	for ; i > 12; i-- {
-		cInstr[i] = '1'
-	}
-
-	for j := 6; i > 5; i, j = i-1, j-1 {
-		switch comp >> j & 1 {
-		case 0:
-			cInstr[i] = '0'
-		case 1:
-			cInstr[i] = '1'
-		}
-	}
-
-	for j := 2; i > 2; i, j = i-1, j-1 {
-		switch dest >> j & 1 {
-		case 0:
-			cInstr[i] = '0'
-		case 1:
-			cInstr[i] = '1'
-		}
-	}
-
-	for j := 2; i > -1; i, j = i-1, j-1 {
-		switch jump >> j & 1 {
-		case 0:
-			cInstr[i] = '0'
-		case 1:
-			cInstr[i] = '1'
-		}
-	}
-
-	return string(cInstr)
+func (f Format) IsValid() bool {
+	return f == Binary || f == Text || f == NotSelected
 }
